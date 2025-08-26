@@ -6,7 +6,7 @@ Demonstrates Google's Grain library for distributed data loading across
 multiple GPUs with JAX using actual Grain IndexSampler and DataLoader.
 
 Usage:
-  python grain_sharding_demo.py --num_gpus 4 --batch_size 128 --records 10000
+  python play-grain-sharding.py --num_gpus 4 --batch_size 128 --records 10000
 
 Profiling with NVIDIA Nsight Systems:
   nsys profile python grain_sharding_demo.py --num_gpus 4 --batch_size 128
@@ -15,7 +15,7 @@ Profiling with NVIDIA Nsight Systems:
 
 NCCL Troubleshooting (if needed):
   export NCCL_P2P_DISABLE=1
-  python grain_sharding_demo.py --num_gpus 10 --batch_size 320
+  python play-grain-sharding.py --num_gpus 10 --batch_size 320
 """
 
 import jax
@@ -24,11 +24,20 @@ from jax import sharding
 from typing import Iterator
 import time
 import argparse
+import grain.python as grain
 
-# Import actual Grain library
-import grain
-from grain.samplers import IndexSampler
-from grain.sharding import ShardOptions
+class IndexToDataTransform(grain.MapTransform):
+    """Transform indices to actual data arrays."""
+
+    def __init__(self, input_dim: int, seed: int = 42):
+        self.input_dim = input_dim
+        self.base_key = jax.random.PRNGKey(seed)
+
+    def map(self, index: int) -> jnp.ndarray:
+        # Generate deterministic data based on index
+        key = jax.random.fold_in(self.base_key, index)
+        sample = jax.random.normal(key, (self.input_dim,), dtype=jnp.float32)
+        return sample  # Return JAX array directly, no numpy conversion
 
 
 class SimpleNeuralNetwork:
@@ -116,50 +125,51 @@ def main():
 
     device_mesh = create_device_mesh(args.num_gpus)
 
-    # Create data using Grain's MapDataset with JAX random
+    # Create data using Grain's RangeDataSource (we'll transform it in operations)
     print(f"\nCreating dataset with {args.records} records...")
-    key = jax.random.PRNGKey(42)
-    dummy_data = []
-    for i in range(args.records):
-        key, subkey = jax.random.split(key)
-        sample = jax.random.normal(subkey, (args.input_dim,), dtype=jnp.float32)
-        dummy_data.append(sample)
-    data_source = grain.MapDataset.source(dummy_data)
+    # Use RangeDataSource which just provides indices, transform them to actual data in operations
+    data_source = grain.RangeDataSource(start=0, stop=args.records, step=1)
     print(f"Dataset created with {len(data_source)} records")
 
-    # Create Grain data loaders with proper sharding
-    records_per_shard = args.records // args.num_gpus  # With drop_remainder=True
-    batches_per_shard = records_per_shard // args.batch_size
-    
-    print(f"\nSharding details:")
-    print(f"  Records per GPU: {records_per_shard}")
-    print(f"  Batches per GPU per epoch: {batches_per_shard}")
-    
-    data_loaders = []
-    for device_idx in range(args.num_gpus):
-        # Create IndexSampler with ShardOptions for this device
-        sampler = IndexSampler(
-            num_records=args.records,
-            shard_options=ShardOptions(
-                shard_index=device_idx,
-                shard_count=args.num_gpus,
-                drop_remainder=True
-            ),
-            shuffle=args.shuffle,
-            num_epochs=None,  # Infinite epochs for iteration-based training
-            seed=args.seed
-        )
+    # Create single Grain DataLoader with proper sharding
+    print(f"\nCreating Grain DataLoader with sharding across {args.num_gpus} devices...")
 
-        # Create Grain DataLoader with batching operation
-        data_loader = grain.DataLoader(
-            data_source=data_source,
-            sampler=sampler,
-            operations=[grain.transforms.Batch(batch_size=args.batch_size)],
-            worker_count=0,  # Single process for simplicity
-        )
-        data_loaders.append(data_loader)
+    # Calculate shard information for current process
+    # In a real multi-process setup, this would be determined by jax.process_index()
+    process_index = 0  # Single process for this demo
+    process_count = 1  # Single process for this demo
 
-        print(f"Shard {device_idx}: {records_per_shard} records, {batches_per_shard} batches/epoch")
+    # Create IndexSampler with ShardOptions
+    sampler = grain.IndexSampler(
+        num_records=args.records,
+        shard_options=grain.ShardOptions(
+            shard_index=process_index,
+            shard_count=process_count,
+            drop_remainder=True
+        ),
+        shuffle=args.shuffle,
+        num_epochs=None,  # Infinite epochs for iteration-based training
+        seed=args.seed
+    )
+
+    # Create single DataLoader with data transformation and batching
+    # The global batch size will be split across devices by JAX sharding
+    data_loader = grain.DataLoader(
+        data_source=data_source,
+        sampler=sampler,
+        operations=[
+            IndexToDataTransform(input_dim=args.input_dim, seed=42),
+            grain.Batch(batch_size=global_batch_size)
+        ],
+        worker_count=0,  # Single process for simplicity
+    )
+
+    print(f"DataLoader created with global batch size: {global_batch_size}")
+    records_per_epoch = args.records // process_count
+    # Since we used drop_remainder=True, adjust for batching
+    records_per_epoch = (records_per_epoch // global_batch_size) * global_batch_size
+    print(f"Records per epoch: {records_per_epoch}")
+    print(f"Batches per epoch: {records_per_epoch // global_batch_size}")
 
     model = SimpleNeuralNetwork(
         input_size=args.input_dim,
@@ -172,22 +182,21 @@ def main():
         return model.loss(x_batch, y_batch)
 
     print(f"\nStarting iteration-based training...")
-    
-    # Create device iterators for infinite data stream
-    device_iterators = [iter(loader) for loader in data_loaders]
-    
+
+    # Create single data iterator
+    data_iter = iter(data_loader)
+
     # Training loop with iteration-based progress
     start_time = time.time()
     for step in range(args.max_steps):
-        # Get batches from all devices
-        device_batches = [next(device_iter) for device_iter in device_iterators]
-        global_batch = jnp.concatenate(device_batches, axis=0)
+        # Get global batch from single data loader
+        global_batch = next(data_iter)
         x_sharded = shard_batch(global_batch, device_mesh)
         y_sharded = create_dummy_targets(global_batch.shape, 10, device_mesh)
 
         # Compute loss
         loss_value = compute_loss(x_sharded, y_sharded)
-        
+
         # Log progress every 10 steps
         if (step + 1) % 10 == 0 or step == 0:
             # Calculate current epoch (derived when needed)
@@ -195,7 +204,7 @@ def main():
             current_epoch = samples_processed / args.records
             elapsed_time = time.time() - start_time
             steps_per_sec = (step + 1) / elapsed_time if elapsed_time > 0 else 0
-            
+
             print(f"Step {step + 1}/{args.max_steps} (epoch {current_epoch:.2f}): "
                   f"loss={loss_value:.4f}, {steps_per_sec:.1f} steps/s")
 
